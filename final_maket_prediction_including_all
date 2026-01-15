@@ -1,0 +1,203 @@
+# FILE: final_market_intelligence.py
+# Kisan Mitra – Final Market Intelligence
+# Demand + Price + Transport + Profit + JSON Output
+# ML MODELS OPTIONAL | JSON SAVED IN PROJECT FOLDER
+
+import os
+import json
+import joblib
+import pandas as pd
+
+# -------------------------------------------------
+# BASE DIRECTORY (THIS FIXES YOUR JSON LOCATION ISSUE)
+# -------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ---------------- PATHS (JOBLIB ONLY) ----------------
+DEMAND_MODEL_PATH = os.path.join(BASE_DIR, "market_shortage_model.joblib")
+MARKET_ENCODER_PATH = os.path.join(BASE_DIR, "market_encoder.joblib")
+COMMODITY_ENCODER_PATH = os.path.join(BASE_DIR, "commodity_encoder.joblib")
+STATUS_ENCODER_PATH = os.path.join(BASE_DIR, "status_encoder.joblib")
+
+PRICE_MODEL_PATH = os.path.join(BASE_DIR, "price_prediction_model.joblib")
+PRICE_MARKET_ENCODER_PATH = os.path.join(BASE_DIR, "price_market_encoder.joblib")
+PRICE_COMMODITY_ENCODER_PATH = os.path.join(BASE_DIR, "price_commodity_encoder.joblib")
+
+# ---------------- SAFE LOAD ----------------
+def safe_load(path):
+    return joblib.load(path) if os.path.exists(path) else None
+
+# ---------------- LOAD MODELS (OPTIONAL) ----------------
+demand_model = safe_load(DEMAND_MODEL_PATH)
+market_encoder = safe_load(MARKET_ENCODER_PATH)
+commodity_encoder = safe_load(COMMODITY_ENCODER_PATH)
+status_encoder = safe_load(STATUS_ENCODER_PATH)
+
+price_model = safe_load(PRICE_MODEL_PATH)
+price_market_encoder = safe_load(PRICE_MARKET_ENCODER_PATH)
+price_commodity_encoder = safe_load(PRICE_COMMODITY_ENCODER_PATH)
+
+ML_DEMAND_AVAILABLE = all([
+    demand_model, market_encoder, commodity_encoder, status_encoder
+])
+
+ML_PRICE_AVAILABLE = all([
+    price_model, price_market_encoder, price_commodity_encoder
+])
+
+# ---------------- CONSTANTS ----------------
+NEARBY_MARKETS = ["Goa", "Kolhapur", "Sangli", "Dharwad"]
+
+STATUS_SEVERITY = {
+    "High Demand": "HIGH",
+    "Normal": "MEDIUM",
+    "Over Supply": "LOW"
+}
+
+MARKET_ROUTES = {
+    "Goa": {"path": ["Belagavi", "Amboli", "Goa"], "distance_km": 200},
+    "Kolhapur": {"path": ["Belagavi", "Nippani", "Kolhapur"], "distance_km": 110},
+    "Sangli": {"path": ["Belagavi", "Sankeshwar", "Sangli"], "distance_km": 130},
+    "Dharwad": {"path": ["Belagavi", "Hubli", "Dharwad"], "distance_km": 75}
+}
+
+VEHICLES = {
+    "Mini Truck": {"capacity": 1000, "rate_per_km": 28},
+    "Tempo": {"capacity": 2500, "rate_per_km": 32},
+    "Truck": {"capacity": 5000, "rate_per_km": 38}
+}
+
+PRICE_CHANGE_MAP = {
+    "Kolhapur": 350,
+    "Sangli": 80,
+    "Dharwad": 150,
+    "Goa": -200
+}
+
+BASE_COMMODITY_PRICE = {
+    "Onion": 25,
+    "Tomato": 30,
+    "Chilli": 80,
+    "Brinjal": 35,
+    "Potato": 28,
+    "Cabbage": 22,
+    "Cauliflower": 26
+}
+
+CITY_ADJUSTMENT = {
+    "Goa": 4,
+    "Kolhapur": 2,
+    "Sangli": 1,
+    "Dharwad": 0
+}
+
+# ---------------- HELPERS ----------------
+def select_vehicle(quantity_kg):
+    for name, v in VEHICLES.items():
+        if quantity_kg <= v["capacity"]:
+            return name, v
+    return "Truck", VEHICLES["Truck"]
+
+def calculate_transport_cost(distance_km, quantity_kg):
+    vehicle_name, vehicle = select_vehicle(quantity_kg)
+    base_cost = distance_km * vehicle["rate_per_km"]
+    loading = 2000
+    toll = distance_km * 5
+    return vehicle_name, int(base_cost + loading + toll)
+
+def predict_price_per_kg(commodity, market, month, price_change):
+    if (
+        ML_PRICE_AVAILABLE and
+        commodity in price_commodity_encoder.classes_ and
+        market in price_market_encoder.classes_
+    ):
+        sample = pd.DataFrame([{
+            "Market Name": price_market_encoder.transform([market])[0],
+            "Commodity": price_commodity_encoder.transform([commodity])[0],
+            "Month": month,
+            "Price_Change": price_change
+        }])
+        price = price_model.predict(sample)[0]
+        return round(price / 100, 2), "ML"
+
+    base = BASE_COMMODITY_PRICE.get(commodity, 30)
+    seasonal = 1.05 if month in [6, 7, 8] else 1.0
+    return round((base + CITY_ADJUSTMENT.get(market, 1)) * seasonal, 2), "Fallback"
+
+# ---------------- MAIN FUNCTION ----------------
+def generate_final_market_json(commodity, month, quantity_kg):
+    results = []
+
+    for market in NEARBY_MARKETS:
+        price_change = PRICE_CHANGE_MAP.get(market, 0)
+
+        # Demand prediction
+        if (
+            ML_DEMAND_AVAILABLE and
+            market in market_encoder.classes_ and
+            commodity in commodity_encoder.classes_
+        ):
+            sample = pd.DataFrame([{
+                "Market Name": market_encoder.transform([market])[0],
+                "Commodity": commodity_encoder.transform([commodity])[0],
+                "Month": month,
+                "Modal_Price": 1200,
+                "Price_Change": price_change
+            }])
+            status = status_encoder.inverse_transform(
+                demand_model.predict(sample)
+            )[0]
+        else:
+            status = "Normal"
+
+        severity = STATUS_SEVERITY.get(status, "MEDIUM")
+
+        vehicle, transport_cost = calculate_transport_cost(
+            MARKET_ROUTES[market]["distance_km"], quantity_kg
+        )
+
+        price_per_kg, source = predict_price_per_kg(
+            commodity, market, month, price_change
+        )
+
+        net_profit = int(price_per_kg * quantity_kg - transport_cost)
+
+        results.append({
+            "market": market,
+            "status": status,
+            "severity": severity,
+            "route": MARKET_ROUTES[market]["path"],
+            "distance_km": MARKET_ROUTES[market]["distance_km"],
+            "vehicle": vehicle,
+            "transport_cost": transport_cost,
+            "predicted_price_per_kg": price_per_kg,
+            "price_source": source,
+            "net_profit": net_profit
+        })
+
+    results.sort(key=lambda x: x["net_profit"], reverse=True)
+
+    final_output = {
+        "commodity": commodity,
+        "quantity_kg": quantity_kg,
+        "markets": results
+    }
+
+    # -------- SAVE JSON IN PROJECT DIRECTORY --------
+    json_dir = os.path.join(BASE_DIR, "json_output")
+    os.makedirs(json_dir, exist_ok=True)
+
+    output_path = os.path.join(
+        json_dir,
+        f"{commodity.lower()}_final_market_output.json"
+    )
+
+    with open(output_path, "w") as f:
+        json.dump(final_output, f, indent=4)
+
+    print("JSON file created at:")
+    print(output_path)
+
+# ---------------- RUN ----------------
+if __name__ == "__main__":
+    generate_final_market_json("Onion", 1, 1500)
